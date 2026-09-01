@@ -17,8 +17,16 @@ if [ ! -f /etc/void-release ] && ! grep -qi void /etc/os-release 2>/dev/null; th
     exit 1
 fi
 
-echo "==> Installing build dependencies one by one..."
-for pkg in git base-devel pkg-config wlroots0.19-devel wayland-devel libxkbcommon-devel libinput-devel pixman-devel libglvnd-devel mesa; do
+echo "==> Installing system & build dependencies..."
+# - dbus + elogind (or seatd) son obligatorios en una Void limpia: sin ellos
+#   la sesión Wayland no tiene bus ni gestor de seats y wlroots falla.
+# - pciutils provee lspci para la detección de GPU.
+# - libdrm-devel / libgbm-devel / libseat-devel / wayland-protocols /
+#   eudev-libudev-devel son deps de wlroots que en Void no siempre vienen
+#   con el metapaquete y hacen que el make falle si faltan.
+#   wlroots0.19-devel arrastra muchas, pero las listamos explícitas para
+#   instalaciones mínimas / plantillas sin X.
+for pkg in git base-devel pkg-config dbus elogind pciutils wlroots0.19-devel wayland-devel wayland-protocols libxkbcommon-devel libinput-devel pixman-devel libglvnd-devel mesa libdrm-devel libgbm-devel libseat-devel eudev-libudev-devel; do
     if xbps-query "$pkg" >/dev/null 2>&1; then
         echo "    $pkg already installed, skipping"
     else
@@ -26,6 +34,15 @@ for pkg in git base-devel pkg-config wlroots0.19-devel wayland-devel libxkbcommo
         sudo xbps-install -S "$pkg"
     fi
 done
+
+# seatd es alternativa válida a elogind en Void. Si el usuario prefiere
+# seatd, lo instalamos como fallback pero priorizamos elogind (más común
+# en desktops). No lo forzamos si elogind ya está.
+if ! xbps-query seatd >/dev/null 2>&1; then
+    # no error si falla la instalación de seatd en mirrors sin él
+    echo "    Installing seatd (fallback seat manager, optional)..."
+    sudo xbps-install -S seatd 2>/dev/null || echo "    seatd not available, continuing with elogind"
+fi
 
 echo "==> Detecting GPU..."
 if ! command -v lspci >/dev/null 2>&1 || ! lspci 2>/dev/null | grep -E "(VGA|3D)" | grep -q .; then
@@ -77,7 +94,9 @@ else
 fi
 
 echo "==> Adding user to required groups..."
-for grp in video input seat; do
+# Nota: en Void no existe el grupo 'seat' (es de seatd en otras distros).
+# Solo se requieren 'video' e 'input' para DRM/input sin root.
+for grp in video input; do
     if getent group "$grp" >/dev/null 2>&1; then
         if id -nG "$USER_NAME" 2>/dev/null | tr ' ' '\n' | grep -qx "$grp"; then
             echo "    $USER_NAME already in group '$grp', skipping"
@@ -91,7 +110,15 @@ for grp in video input seat; do
 done
 
 echo "==> Enabling services..."
+# En Void limpia /etc/sv/dbus y /etc/sv/elogind no existen hasta instalar
+# los paquetes. Arriba ya los instalamos, aquí solo los habilitamos.
+# Se habilita dbus + elogind por defecto; seatd solo como fallback si
+# elogind no está disponible (elegir uno es suficiente).
 for svc in dbus elogind; do
+    if [ ! -d "/etc/sv/$svc" ]; then
+        echo "    $svc service directory not found, trying to install package $svc..."
+        sudo xbps-install -S "$svc" 2>/dev/null || echo "    Could not install $svc, skipping"
+    fi
     if [ -L "/var/service/$svc" ]; then
         echo "    $svc already enabled, skipping"
     elif [ -d "/etc/sv/$svc" ]; then
@@ -101,6 +128,18 @@ for svc in dbus elogind; do
         echo "    $svc service directory not found, skipping"
     fi
 done
+
+# Fallback a seatd solo si elogind no quedó habilitado
+if [ ! -L "/var/service/elogind" ] && [ -d "/etc/sv/seatd" ]; then
+    if [ -L "/var/service/seatd" ]; then
+        echo "    seatd already enabled, skipping"
+    else
+        sudo ln -s /etc/sv/seatd /var/service/
+        echo "    seatd enabled (fallback for elogind)"
+    fi
+elif [ -L "/var/service/elogind" ] && [ -L "/var/service/seatd" ]; then
+    echo "    Note: both elogind and seatd enabled (only one seat manager is needed)"
+fi
 
 echo "==> Fetching backbone source..."
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
